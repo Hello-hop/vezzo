@@ -19,12 +19,13 @@ object Defaults {
 
     const val SMS_INITIAL =
         "Bonjour {PRENOM}, peux-tu m'indiquer tes disponibilités pour {MOIS} ? " +
-        "Réponds simplement avec le jour suivi de M (matin), A (après-midi) ou J (journée complète). " +
-        "Exemple : 3M 5J 12A 18M. Merci !"
+        "Indique-moi les jours où tu es libre, en précisant si c'est le matin, " +
+        "l'après-midi ou la journée complète. Merci !"
 
     const val SMS_RELANCE =
         "Bonjour {PRENOM}, petit rappel : je n'ai pas encore reçu tes disponibilités pour {MOIS}. " +
-        "Réponds avec le jour + M, A ou J (ex : 3M 5J 12A). Merci beaucoup !"
+        "Dis-moi les jours où tu es libre, et si c'est le matin, l'après-midi ou " +
+        "la journée entière. Merci beaucoup !"
 }
 
 /** Mois à planifier : par défaut le mois suivant le mois en cours. */
@@ -82,7 +83,19 @@ class Store(context: Context) {
     /** Date du dernier envoi groupé : sert de point de départ pour lire les réponses. */
     var lastSendMillis: Long
         get() = prefs.getLong(KEY_LAST_SEND, 0L)
-        set(v) = prefs.edit().putLong(KEY_LAST_SEND, v).apply()
+        set(v) = prefs.edit()
+            .putLong(KEY_LAST_SEND, v)
+            .putStringSet(KEY_MANUAL_ANSWERED, emptySet())
+            .apply()
+
+    /** Numéros normalisés que l'utilisateur a validés manuellement comme "a répondu". */
+    var manuallyAnswered: Set<String>
+        get() = prefs.getStringSet(KEY_MANUAL_ANSWERED, emptySet()) ?: emptySet()
+        set(v) = prefs.edit().putStringSet(KEY_MANUAL_ANSWERED, v).apply()
+
+    fun markAnswered(phone: String) {
+        manuallyAnswered = manuallyAnswered + PhoneUtils.normalize(phone)
+    }
 
     /** Si activé, l'export ne contient que les prénoms. */
     var anonymize: Boolean
@@ -108,6 +121,7 @@ class Store(context: Context) {
         const val KEY_ADMIN_EMAIL = "admin_email"
         const val KEY_LAST_SEND = "last_send"
         const val KEY_ANONYMIZE = "anonymize"
+        const val KEY_MANUAL_ANSWERED = "manual_answered"
     }
 }
 
