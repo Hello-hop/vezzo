@@ -4,8 +4,10 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
 import android.provider.ContactsContract
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -15,6 +17,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
@@ -25,9 +28,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 
 enum class Screen { HOME, SMS_GROUPE, RELANCE, EXPORT }
 
@@ -35,25 +42,159 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        askPermissions()
         setContent {
             MaterialTheme(colorScheme = lightColorScheme()) {
-                VezzoApp()
+                RootScreen()
             }
         }
     }
+}
 
-    private fun askPermissions() {
-        val needed = listOf(
-            Manifest.permission.SEND_SMS,
-            Manifest.permission.READ_SMS,
-            Manifest.permission.RECEIVE_SMS
-        ).filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+val REQUIRED_PERMISSIONS = arrayOf(
+    Manifest.permission.SEND_SMS,
+    Manifest.permission.READ_SMS,
+    Manifest.permission.RECEIVE_SMS
+)
+
+fun hasAllPermissions(context: android.content.Context): Boolean =
+    REQUIRED_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+    }
+
+/**
+ * Filtre d'entrée : explique pourquoi les autorisations sont nécessaires,
+ * les demande, et propose une porte de sortie vers les paramètres système
+ * si Android a définitivement bloqué la demande.
+ */
+@Composable
+fun RootScreen() {
+    val context = LocalContext.current
+    val activity = context as Activity
+    var granted by remember { mutableStateOf(hasAllPermissions(context)) }
+    var asked by remember { mutableStateOf(false) }
+    var bypass by remember { mutableStateOf(false) }
+
+    // Re-vérifie au retour depuis les paramètres système.
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) granted = hasAllPermissions(context)
         }
-        if (needed.isNotEmpty()) {
-            requestPermissions(needed.toTypedArray(), 1001)
+        owner.lifecycle.addObserver(observer)
+        onDispose { owner.lifecycle.removeObserver(observer) }
+    }
+
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        asked = true
+        granted = result.values.all { it }
+    }
+
+    val permanentlyBlocked = asked && !granted &&
+        REQUIRED_PERMISSIONS.none { activity.shouldShowRequestPermissionRationale(it) }
+
+    if (granted || bypass) {
+        VezzoApp()
+    } else {
+        PermissionScreen(
+            blocked = permanentlyBlocked,
+            onRequest = { launcher.launch(REQUIRED_PERMISSIONS) },
+            onOpenSettings = {
+                val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.fromParts("package", context.packageName, null)
+                }
+                context.startActivity(intent)
+            },
+            onContinueAnyway = { bypass = true }
+        )
+    }
+}
+
+@Composable
+fun PermissionScreen(
+    blocked: Boolean,
+    onRequest: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onContinueAnyway: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(28.dp),
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text("Bienvenue dans Vezzo", fontWeight = FontWeight.Bold, fontSize = 24.sp)
+        Spacer(Modifier.height(18.dp))
+        Text(
+            "Pour fonctionner, l'application a besoin de deux autorisations :",
+            fontSize = 15.sp
+        )
+        Spacer(Modifier.height(14.dp))
+        Text("• Envoyer des SMS", fontWeight = FontWeight.Medium)
+        Text(
+            "pour transmettre la demande de disponibilités à toute ta liste en un appui.",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(10.dp))
+        Text("• Lire les SMS reçus", fontWeight = FontWeight.Medium)
+        Text(
+            "pour repérer qui a répondu et rassembler les réponses dans l'export.",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(18.dp))
+        Text(
+            "Rien n'est envoyé sur Internet. Tes messages et tes contacts restent " +
+                "sur ce téléphone, sauf si tu déclenches toi-même un export.",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(Modifier.height(28.dp))
+
+        if (blocked) {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer
+                )
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Autorisation bloquée par Android", fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Android bloque les permissions SMS pour les applications installées " +
+                            "hors Play Store. Ouvre les paramètres, puis : menu ⋮ en haut à " +
+                            "droite → Autoriser les paramètres restreints. Reviens ensuite " +
+                            "dans Autorisations → SMS → Autoriser.",
+                        fontSize = 13.sp
+                    )
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = onOpenSettings,
+                modifier = Modifier.fillMaxWidth().height(52.dp)
+            ) { Text("OUVRIR LES PARAMÈTRES", fontWeight = FontWeight.Bold) }
+        } else {
+            Button(
+                onClick = onRequest,
+                modifier = Modifier.fillMaxWidth().height(52.dp)
+            ) { Text("AUTORISER", fontWeight = FontWeight.Bold) }
+            Spacer(Modifier.height(8.dp))
+            TextButton(
+                onClick = onOpenSettings,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Autoriser manuellement dans les paramètres") }
         }
+
+        Spacer(Modifier.height(4.dp))
+        TextButton(
+            onClick = onContinueAnyway,
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Continuer sans autoriser (fonctions limitées)") }
     }
 }
 
@@ -181,6 +322,7 @@ fun SmsGroupeScreen(store: Store, refreshKey: Int, onRefresh: () -> Unit, back: 
     var contacts by remember(refreshKey) { mutableStateOf(store.contacts) }
     var showSmsDialog by remember { mutableStateOf(false) }
     var showConfirm by remember { mutableStateOf(false) }
+    var showManualDialog by remember { mutableStateOf(false) }
 
     val pickContact = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -198,6 +340,7 @@ fun SmsGroupeScreen(store: Store, refreshKey: Int, onRefresh: () -> Unit, back: 
                     store.addContact(Contact(name, number))
                     contacts = store.contacts
                     onRefresh()
+                    Toast.makeText(context, "$name ajouté.", Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -253,13 +396,25 @@ fun SmsGroupeScreen(store: Store, refreshKey: Int, onRefresh: () -> Unit, back: 
             ) {
                 OutlinedButton(
                     onClick = {
-                        val intent = Intent(Intent.ACTION_PICK).apply {
-                            type = ContactsContract.CommonDataKinds.Phone.CONTENT_TYPE
+                        val intent = Intent(
+                            Intent.ACTION_PICK,
+                            ContactsContract.CommonDataKinds.Phone.CONTENT_URI
+                        )
+                        runCatching { pickContact.launch(intent) }.onFailure {
+                            Toast.makeText(
+                                context,
+                                "Impossible d'ouvrir le carnet d'adresses.",
+                                Toast.LENGTH_LONG
+                            ).show()
                         }
-                        pickContact.launch(intent)
                     },
                     modifier = Modifier.fillMaxWidth()
-                ) { Text("Ajouter un contact") }
+                ) { Text("Ajouter depuis le carnet d'adresses") }
+
+                OutlinedButton(
+                    onClick = { showManualDialog = true },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Ajouter un numéro à la main") }
 
                 OutlinedButton(
                     onClick = { showSmsDialog = true },
@@ -273,6 +428,18 @@ fun SmsGroupeScreen(store: Store, refreshKey: Int, onRefresh: () -> Unit, back: 
                 ) { Text("ENVOYER À TOUS (${contacts.size})", fontWeight = FontWeight.Bold) }
             }
         }
+    }
+
+    if (showManualDialog) {
+        ContactEditDialog(
+            onDismiss = { showManualDialog = false },
+            onSave = { name, phone ->
+                store.addContact(Contact(name, phone))
+                contacts = store.contacts
+                onRefresh()
+                showManualDialog = false
+            }
+        )
     }
 
     if (showSmsDialog) {
@@ -579,6 +746,47 @@ fun TextEditDialog(
             }
         },
         confirmButton = { TextButton(onClick = { onSave(value) }) { Text("Enregistrer") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } }
+    )
+}
+
+@Composable
+fun ContactEditDialog(
+    onDismiss: () -> Unit,
+    onSave: (String, String) -> Unit
+) {
+    var name by remember { mutableStateOf("") }
+    var phone by remember { mutableStateOf("") }
+    val valid = name.isNotBlank() && phone.filter { it.isDigit() }.length >= 9
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Nouveau contact") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Nom") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = phone,
+                    onValueChange = { phone = it },
+                    label = { Text("Numéro de téléphone") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(name.trim(), phone.trim()) }, enabled = valid) {
+                Text("Ajouter")
+            }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } }
     )
 }
