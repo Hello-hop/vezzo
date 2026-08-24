@@ -26,10 +26,10 @@ object ExportBuilder {
     fun build(context: Context, store: Store): String {
         val contacts = store.contacts
         val since = store.lastSendMillis
-        val replies = SmsService.readReplies(context, contacts, since)
+        val statuses = SmsService.statuses(context, contacts, since, store.manuallyAnswered)
         val month = MonthInfo.label()
         val days = MonthInfo.dayCount()
-        val answered = contacts.count { !replies[PhoneUtils.normalize(it.phone)].isNullOrEmpty() }
+        val answered = statuses.count { it.status == ReplyStatus.ANSWERED }
         val zone = ZoneId.systemDefault()
 
         val sb = StringBuilder()
@@ -39,6 +39,11 @@ object ExportBuilder {
         sb.appendLine("Date de l'export : " + stamp.format(Instant.now().atZone(zone)))
         sb.appendLine("Personnes contactées : ${contacts.size}")
         sb.appendLine("Réponses reçues à ce jour : $answered")
+        if (since <= 0L) {
+            sb.appendLine()
+            sb.appendLine("ATTENTION : aucun envoi groupé n'a encore été effectué.")
+            sb.appendLine("Cet export ne contient donc aucune réponse.")
+        }
         sb.appendLine()
 
         sb.appendLine("--- CE QUE JE TE DEMANDE ---")
@@ -65,10 +70,14 @@ object ExportBuilder {
         sb.appendLine()
 
         sb.appendLine("--- RÈGLES D'INTERPRÉTATION DES RÉPONSES ---")
-        sb.appendLine("Les gens répondent en texte libre, sans format imposé. Interprète au mieux :")
-        sb.appendLine("- M = matin, A ou PM ou AM = après-midi, J = journée complète.")
-        sb.appendLine("- \"3M 5J 12A\" signifie : le 3 au matin, le 5 toute la journée, le 12 l'après-midi.")
+        sb.appendLine("Les gens répondent librement, avec leurs propres mots, sans aucun format")
+        sb.appendLine("imposé. Les messages sont souvent approximatifs. Interprète au mieux :")
         sb.appendLine("- \"dispo le 3 et le 4\" sans précision de créneau = journée complète.")
+        sb.appendLine("- \"le 5 au matin\", \"le 5 dans la matinée\" = matin du 5.")
+        sb.appendLine("- \"l'aprem\", \"l'après-midi\", \"en PM\" = après-midi.")
+        sb.appendLine("- \"toute la journée\", \"en entier\", \"toute la journée du 9\" = journée complète.")
+        sb.appendLine("- Une abréviation isolée (M, A, J après un chiffre) doit être comprise")
+        sb.appendLine("  comme matin, après-midi ou journée, mais ce format n'est pas demandé.")
         sb.appendLine("- \"du 8 au 12\" = tous les jours de 8 à 12 inclus.")
         sb.appendLine("- \"tous les lundis\" = tous les lundis du mois concerné.")
         sb.appendLine("- Les chiffres désignent des jours du mois de $month, jamais un autre mois.")
@@ -86,14 +95,16 @@ object ExportBuilder {
             sb.appendLine("(aucun contact enregistré)")
         }
 
-        contacts.forEach { contact ->
-            val displayName = if (store.anonymize) contact.firstName else contact.name
+        statuses.forEach { cs ->
+            val displayName = if (store.anonymize) cs.contact.firstName else cs.contact.name
             sb.appendLine("### $displayName")
-            val list = replies[PhoneUtils.normalize(contact.phone)].orEmpty()
-            if (list.isEmpty()) {
+            if (cs.replies.isEmpty()) {
                 sb.appendLine("(aucune réponse reçue)")
             } else {
-                list.forEach { r ->
+                if (cs.status == ReplyStatus.UNCLEAR) {
+                    sb.appendLine("(message reçu, mais qui ne semble pas parler de disponibilités)")
+                }
+                cs.replies.forEach { r ->
                     val date = stamp.format(Instant.ofEpochMilli(r.dateMillis).atZone(zone))
                     sb.appendLine("[$date] ${r.body.trim()}")
                 }
