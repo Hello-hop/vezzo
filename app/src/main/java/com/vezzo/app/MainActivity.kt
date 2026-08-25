@@ -28,6 +28,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -413,9 +414,24 @@ object ExportBuilder {
      * Construit le fichier texte destiné à être collé dans une IA.
      * Il contient la consigne de sortie attendue, puis les SMS bruts groupés par personne.
      */
+    /**
+     * Début de la fenêtre de collecte pour l'export : le premier jour du mois en cours,
+     * ou la date du dernier envoi groupé si celui-ci est antérieur. On récupère ainsi
+     * l'intégralité des échanges du mois, sans filtrage sur le contenu.
+     */
+    private fun exportWindowStart(store: Store): Long {
+        val monthStart = YearMonth.now()
+            .atDay(1)
+            .atStartOfDay(ZoneId.systemDefault())
+            .toInstant()
+            .toEpochMilli()
+        val lastSend = store.lastSendMillis
+        return if (lastSend > 0L && lastSend < monthStart) lastSend else monthStart
+    }
+
     fun build(context: Context, store: Store): String {
         val contacts = store.contacts
-        val since = store.lastSendMillis
+        val since = exportWindowStart(store)
         val statuses = SmsService.statuses(context, contacts, since, store.manuallyAnswered)
         val month = MonthInfo.label()
         val days = MonthInfo.dayCount()
@@ -428,11 +444,18 @@ object ExportBuilder {
         sb.appendLine("Mois à planifier : $month ($days jours)")
         sb.appendLine("Date de l'export : " + stamp.format(Instant.now().atZone(zone)))
         sb.appendLine("Personnes contactées : ${contacts.size}")
-        sb.appendLine("Réponses reçues à ce jour : $answered")
-        if (since <= 0L) {
+        sb.appendLine("Réponses identifiées à ce jour : $answered")
+        sb.appendLine(
+            "Messages collectés depuis le : " +
+                stamp.format(Instant.ofEpochMilli(since).atZone(zone))
+        )
+        sb.appendLine()
+        sb.appendLine("Ce fichier contient TOUS les messages reçus de ces personnes sur la")
+        sb.appendLine("période, sans tri préalable. Certains n'ont aucun rapport avec les")
+        sb.appendLine("disponibilités : c'est à toi de faire le tri.")
+        if (store.lastSendMillis <= 0L) {
             sb.appendLine()
             sb.appendLine("ATTENTION : aucun envoi groupé n'a encore été effectué.")
-            sb.appendLine("Cet export ne contient donc aucune réponse.")
         }
         sb.appendLine()
 
@@ -491,9 +514,6 @@ object ExportBuilder {
             if (cs.replies.isEmpty()) {
                 sb.appendLine("(aucune réponse reçue)")
             } else {
-                if (cs.status == ReplyStatus.UNCLEAR) {
-                    sb.appendLine("(message reçu, mais qui ne semble pas parler de disponibilités)")
-                }
                 cs.replies.forEach { r ->
                     val date = stamp.format(Instant.ofEpochMilli(r.dateMillis).atZone(zone))
                     sb.appendLine("[$date] ${r.body.trim()}")
@@ -1026,13 +1046,26 @@ fun RelanceScreen(store: Store, back: () -> Unit) {
         SmsService.statuses(context, contacts, store.lastSendMillis, store.manuallyAnswered)
     }
 
-    // Pré-cochés : tous ceux dont on n'a pas identifié de réponse.
-    var selected by remember(reloadKey) {
-        mutableStateOf(
+    var selected by remember { mutableStateOf(emptySet<String>()) }
+    var initialized by remember { mutableStateOf(false) }
+    var lastSync by remember { mutableStateOf<Long?>(null) }
+
+    // Au premier affichage : tous ceux sans réponse identifiée sont cochés.
+    // À chaque synchronisation : on retire ceux qui ont répondu entre-temps,
+    // sans effacer les décochages faits à la main.
+    LaunchedEffect(statuses) {
+        val answeredKeys = statuses
+            .filter { it.status == ReplyStatus.ANSWERED }
+            .map { PhoneUtils.normalize(it.contact.phone) }
+            .toSet()
+        selected = if (!initialized) {
+            initialized = true
             statuses.filter { it.status != ReplyStatus.ANSWERED }
                 .map { PhoneUtils.normalize(it.contact.phone) }
                 .toSet()
-        )
+        } else {
+            selected - answeredKeys
+        }
     }
 
     var showSmsDialog by remember { mutableStateOf(false) }
@@ -1080,6 +1113,33 @@ fun RelanceScreen(store: Store, back: () -> Unit) {
                         )
                     }
                 }
+            }
+
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = {
+                        reloadKey++
+                        lastSync = System.currentTimeMillis()
+                    },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(Icons.Filled.Refresh, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Synchroniser les messages")
+                }
+            }
+
+            if (lastSync != null) {
+                Text(
+                    "Dernière synchronisation : " + java.text.SimpleDateFormat("HH:mm:ss", Locale.FRENCH)
+                        .format(java.util.Date(lastSync!!)),
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
 
             Row(
