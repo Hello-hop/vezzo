@@ -2,16 +2,22 @@ package com.vezzo.app
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.ContactsContract
 import android.provider.Settings
+import android.provider.Telephony
+import android.telephony.SmsManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -27,14 +33,535 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import java.io.File
+import java.text.Normalizer
+import java.time.Instant
+import java.time.YearMonth
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.format.TextStyle
+import java.util.Locale
+import org.json.JSONArray
+import org.json.JSONObject
+
+/* ===================================================================
+   Section issue de Data.kt
+   =================================================================== */
+
+/** Un contact de la liste des "contacts fréquents". */
+data class Contact(val name: String, val phone: String) {
+    /** Prénom seul, utilisé pour personnaliser le SMS et pour l'export anonymisé. */
+    val firstName: String
+        get() = name.trim().split(" ").firstOrNull().orEmpty().ifBlank { name }
+}
+
+object Defaults {
+    const val ADMIN_EMAIL = "romain.bilquez@gmail.com"
+
+    const val SMS_INITIAL =
+        "Bonjour {PRENOM}, peux-tu m'indiquer tes disponibilités pour {MOIS} ? " +
+        "Indique-moi les jours où tu es libre, en précisant si c'est le matin, " +
+        "l'après-midi ou la journée complète. Merci !"
+
+    const val SMS_RELANCE =
+        "Bonjour {PRENOM}, petit rappel : je n'ai pas encore reçu tes disponibilités pour {MOIS}. " +
+        "Dis-moi les jours où tu es libre, et si c'est le matin, l'après-midi ou " +
+        "la journée entière. Merci beaucoup !"
+}
+
+/** Mois à planifier : par défaut le mois suivant le mois en cours. */
+object MonthInfo {
+    fun target(): YearMonth = YearMonth.now().plusMonths(1)
+
+    fun label(ym: YearMonth = target()): String {
+        val name = ym.month.getDisplayName(TextStyle.FULL, Locale.FRENCH)
+        return "$name ${ym.year}"
+    }
+
+    fun dayCount(ym: YearMonth = target()): Int = ym.lengthOfMonth()
+}
+
+/**
+ * Stockage local simple : SharedPreferences + JSON.
+ * Aucune donnée ne quitte le téléphone tant que tu ne lances pas un export.
+ */
+class Store(context: Context) {
+
+    private val prefs = context.applicationContext
+        .getSharedPreferences("vezzo_store", Context.MODE_PRIVATE)
+
+    var contacts: List<Contact>
+        get() {
+            val raw = prefs.getString(KEY_CONTACTS, null) ?: return emptyList()
+            return runCatching {
+                val arr = JSONArray(raw)
+                (0 until arr.length()).map { i ->
+                    val o = arr.getJSONObject(i)
+                    Contact(o.getString("name"), o.getString("phone"))
+                }
+            }.getOrDefault(emptyList())
+        }
+        set(value) {
+            val arr = JSONArray()
+            value.forEach { c ->
+                arr.put(JSONObject().put("name", c.name).put("phone", c.phone))
+            }
+            prefs.edit().putString(KEY_CONTACTS, arr.toString()).apply()
+        }
+
+    var smsInitial: String
+        get() = prefs.getString(KEY_SMS_INITIAL, Defaults.SMS_INITIAL) ?: Defaults.SMS_INITIAL
+        set(v) = prefs.edit().putString(KEY_SMS_INITIAL, v).apply()
+
+    var smsRelance: String
+        get() = prefs.getString(KEY_SMS_RELANCE, Defaults.SMS_RELANCE) ?: Defaults.SMS_RELANCE
+        set(v) = prefs.edit().putString(KEY_SMS_RELANCE, v).apply()
+
+    var adminEmail: String
+        get() = prefs.getString(KEY_ADMIN_EMAIL, Defaults.ADMIN_EMAIL) ?: Defaults.ADMIN_EMAIL
+        set(v) = prefs.edit().putString(KEY_ADMIN_EMAIL, v).apply()
+
+    /** Date du dernier envoi groupé : sert de point de départ pour lire les réponses. */
+    var lastSendMillis: Long
+        get() = prefs.getLong(KEY_LAST_SEND, 0L)
+        set(v) = prefs.edit()
+            .putLong(KEY_LAST_SEND, v)
+            .putStringSet(KEY_MANUAL_ANSWERED, emptySet())
+            .apply()
+
+    /** Numéros normalisés que l'utilisateur a validés manuellement comme "a répondu". */
+    var manuallyAnswered: Set<String>
+        get() = prefs.getStringSet(KEY_MANUAL_ANSWERED, emptySet()) ?: emptySet()
+        set(v) = prefs.edit().putStringSet(KEY_MANUAL_ANSWERED, v).apply()
+
+    fun markAnswered(phone: String) {
+        manuallyAnswered = manuallyAnswered + PhoneUtils.normalize(phone)
+    }
+
+    /** Si activé, l'export ne contient que les prénoms. */
+    var anonymize: Boolean
+        get() = prefs.getBoolean(KEY_ANONYMIZE, false)
+        set(v) = prefs.edit().putBoolean(KEY_ANONYMIZE, v).apply()
+
+    fun addContact(c: Contact) {
+        val normalized = PhoneUtils.normalize(c.phone)
+        if (contacts.any { PhoneUtils.normalize(it.phone) == normalized }) return
+        contacts = contacts + c
+    }
+
+    fun removeContact(c: Contact) {
+        contacts = contacts.filterNot {
+            it.name == c.name && PhoneUtils.normalize(it.phone) == PhoneUtils.normalize(c.phone)
+        }
+    }
+
+    private companion object {
+        const val KEY_CONTACTS = "contacts"
+        const val KEY_SMS_INITIAL = "sms_initial"
+        const val KEY_SMS_RELANCE = "sms_relance"
+        const val KEY_ADMIN_EMAIL = "admin_email"
+        const val KEY_LAST_SEND = "last_send"
+        const val KEY_ANONYMIZE = "anonymize"
+        const val KEY_MANUAL_ANSWERED = "manual_answered"
+    }
+}
+
+object PhoneUtils {
+    /**
+     * Réduit un numéro à ses 9 derniers chiffres.
+     * Cela permet de faire correspondre 06 12 34 56 78 et +33 6 12 34 56 78.
+     */
+    fun normalize(raw: String): String {
+        val digits = raw.filter { it.isDigit() }
+        return if (digits.length > 9) digits.takeLast(9) else digits
+    }
+
+    fun same(a: String, b: String): Boolean {
+        val na = normalize(a)
+        val nb = normalize(b)
+        return na.isNotEmpty() && na == nb
+    }
+}
+
+/** Remplace les variables {PRENOM} et {MOIS} dans un modèle de SMS. */
+fun String.fillTemplate(contact: Contact): String =
+    replace("{PRENOM}", contact.firstName)
+        .replace("{MOIS}", MonthInfo.label())
+
+/* ===================================================================
+   Section issue de Sms.kt
+   =================================================================== */
+
+/** Un SMS reçu d'un contact. */
+data class Reply(val dateMillis: Long, val body: String)
+
+/** Résultat d'un envoi groupé. */
+data class SendResult(val sent: Int, val failed: List<String>)
+
+/** État d'un contact vis-à-vis de la demande de disponibilités. */
+enum class ReplyStatus {
+    /** A répondu, et le message ressemble bien à une réponse de disponibilités. */
+    ANSWERED,
+
+    /** A envoyé un ou plusieurs SMS, mais aucun ne ressemble à une réponse. */
+    UNCLEAR,
+
+    /** N'a rien envoyé depuis l'envoi groupé. */
+    NONE
+}
+
+data class ContactStatus(
+    val contact: Contact,
+    val status: ReplyStatus,
+    val replies: List<Reply>
+) {
+    val lastMessage: String
+        get() = replies.lastOrNull()?.body?.trim().orEmpty()
+}
+
+/**
+ * Décide si un SMS reçu constitue une réponse à la demande de disponibilités.
+ * Volontairement large : mieux vaut classer en "à vérifier" que d'ignorer une vraie réponse.
+ */
+object ReplyClassifier {
+
+    /** Mots entiers uniquement : "jour" ne doit pas être trouvé dans "bonjour". */
+    private val KEYWORDS = listOf(
+        "dispo", "dispos", "disponible", "disponibles", "disponibilite", "disponibilites",
+        "indispo", "indisponible", "indisponibles",
+        "matin", "matins", "matinee",
+        "aprem", "aprems", "apres-midi", "apresmidi", "pm", "am", "midi",
+        "jour", "jours", "journee", "journees", "toute", "complet", "complete",
+        "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
+        "lundis", "mardis", "mercredis", "jeudis", "vendredis", "samedis", "dimanches",
+        "semaine", "semaines", "weekend", "week-end",
+        "libre", "libres", "occupe", "occupee", "pris", "prise",
+        "present", "presente", "absent", "absente",
+        "conge", "conges", "vacances", "repos", "travail", "boulot",
+        "janvier", "fevrier", "mars", "avril", "mai", "juin", "juillet",
+        "aout", "septembre", "octobre", "novembre", "decembre",
+        "rien", "aucun", "aucune", "peux", "peut", "pourrai", "possible"
+    )
+
+    private val KEYWORD_REGEX = Regex(
+        "\\b(" + KEYWORDS.joinToString("|") { Regex.escape(it) } + ")\\b"
+    )
+
+    /** Plages type "du 8 au 12". */
+    private val RANGE_REGEX = Regex("\\bdu\\s+[0-9]{1,2}\\s+au\\s+[0-9]{1,2}\\b")
+
+    private val NUMBER_REGEX = Regex("\\b([0-9]{1,2})\\b")
+
+    /** Minuscules sans accents, pour comparer de façon fiable. */
+    private fun normalize(text: String): String =
+        Normalizer.normalize(text.lowercase(), Normalizer.Form.NFD)
+            .replace(Regex("\\p{InCombiningDiacriticalMarks}+"), "")
+
+    fun looksLikeAvailability(body: String): Boolean {
+        val t = normalize(body)
+        if (t.isBlank()) return false
+
+        if (KEYWORD_REGEX.containsMatchIn(t)) return true
+        if (RANGE_REGEX.containsMatchIn(t)) return true
+
+        // Message court composé de plusieurs nombres compris entre 1 et 31 :
+        // typiquement une liste de jours envoyée sans aucun mot.
+        val dayNumbers = NUMBER_REGEX.findAll(t)
+            .mapNotNull { it.groupValues[1].toIntOrNull() }
+            .count { it in 1..31 }
+        if (dayNumbers >= 2 && t.length <= 200) return true
+
+        return false
+    }
+}
+
+object SmsService {
+
+    private fun manager(context: Context): SmsManager =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            context.getSystemService(SmsManager::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            SmsManager.getDefault()
+        }
+
+    private fun sendOne(context: Context, phone: String, body: String) {
+        val sms = manager(context)
+        val parts = sms.divideMessage(body)
+        if (parts.size <= 1) {
+            sms.sendTextMessage(phone, null, body, null, null)
+        } else {
+            sms.sendMultipartTextMessage(phone, null, parts, null, null)
+        }
+    }
+
+    /**
+     * Envoie le même message à toute une liste, en personnalisant {PRENOM} et {MOIS}.
+     * Une courte pause sépare chaque envoi pour éviter un blocage opérateur.
+     */
+    fun sendToAll(context: Context, contacts: List<Contact>, template: String): SendResult {
+        var sent = 0
+        val failed = mutableListOf<String>()
+        contacts.forEach { contact ->
+            try {
+                sendOne(context, contact.phone, template.fillTemplate(contact))
+                sent++
+                Thread.sleep(400)
+            } catch (e: Exception) {
+                failed.add(contact.name)
+            }
+        }
+        return SendResult(sent, failed)
+    }
+
+    /**
+     * Lit les SMS reçus depuis [sinceMillis] et les associe aux contacts connus.
+     *
+     * Si aucun envoi groupé n'a encore eu lieu, [sinceMillis] vaut zéro : on renvoie
+     * des listes vides plutôt que l'intégralité de la boîte de réception.
+     */
+    fun readReplies(
+        context: Context,
+        contacts: List<Contact>,
+        sinceMillis: Long
+    ): Map<String, List<Reply>> {
+        val byContact = linkedMapOf<String, MutableList<Reply>>()
+        contacts.forEach { byContact[PhoneUtils.normalize(it.phone)] = mutableListOf() }
+
+        if (contacts.isEmpty() || sinceMillis <= 0L) return byContact
+
+        val projection = arrayOf(
+            Telephony.Sms.ADDRESS,
+            Telephony.Sms.BODY,
+            Telephony.Sms.DATE
+        )
+
+        try {
+            context.contentResolver.query(
+                Telephony.Sms.Inbox.CONTENT_URI,
+                projection,
+                "${Telephony.Sms.DATE} > ?",
+                arrayOf(sinceMillis.toString()),
+                "${Telephony.Sms.DATE} ASC"
+            )?.use { cursor ->
+                val iAddr = cursor.getColumnIndexOrThrow(Telephony.Sms.ADDRESS)
+                val iBody = cursor.getColumnIndexOrThrow(Telephony.Sms.BODY)
+                val iDate = cursor.getColumnIndexOrThrow(Telephony.Sms.DATE)
+                while (cursor.moveToNext()) {
+                    val address = cursor.getString(iAddr) ?: continue
+                    val bucket = byContact[PhoneUtils.normalize(address)] ?: continue
+                    bucket.add(Reply(cursor.getLong(iDate), cursor.getString(iBody).orEmpty()))
+                }
+            }
+        } catch (e: Exception) {
+            // Permission refusée ou fournisseur indisponible : listes vides.
+        }
+
+        return byContact
+    }
+
+    /**
+     * Classe chaque contact selon qu'il a répondu, envoyé un message non reconnu,
+     * ou rien envoyé du tout. [manuallyAnswered] contient les numéros normalisés
+     * que l'utilisateur a validés lui-même.
+     */
+    fun statuses(
+        context: Context,
+        contacts: List<Contact>,
+        sinceMillis: Long,
+        manuallyAnswered: Set<String> = emptySet()
+    ): List<ContactStatus> {
+        val replies = readReplies(context, contacts, sinceMillis)
+        return contacts.map { contact ->
+            val key = PhoneUtils.normalize(contact.phone)
+            val list = replies[key].orEmpty()
+            val status = when {
+                // Validation manuelle : couvre le cas d'une réponse donnée de vive voix,
+                // sans aucun SMS reçu.
+                key in manuallyAnswered -> ReplyStatus.ANSWERED
+                list.isEmpty() -> ReplyStatus.NONE
+                list.any { ReplyClassifier.looksLikeAvailability(it.body) } -> ReplyStatus.ANSWERED
+                else -> ReplyStatus.UNCLEAR
+            }
+            ContactStatus(contact, status, list)
+        }
+    }
+}
+
+/* ===================================================================
+   Section issue de Export.kt
+   =================================================================== */
+
+object ExportBuilder {
+
+    private val stamp: DateTimeFormatter =
+        DateTimeFormatter.ofPattern("dd/MM 'à' HH:mm", Locale.FRENCH)
+
+    private val fileStamp: DateTimeFormatter =
+        DateTimeFormatter.ofPattern("yyyy-MM-dd_HHmm", Locale.FRENCH)
+
+    /**
+     * Construit le fichier texte destiné à être collé dans une IA.
+     * Il contient la consigne de sortie attendue, puis les SMS bruts groupés par personne.
+     */
+    fun build(context: Context, store: Store): String {
+        val contacts = store.contacts
+        val since = store.lastSendMillis
+        val statuses = SmsService.statuses(context, contacts, since, store.manuallyAnswered)
+        val month = MonthInfo.label()
+        val days = MonthInfo.dayCount()
+        val answered = statuses.count { it.status == ReplyStatus.ANSWERED }
+        val zone = ZoneId.systemDefault()
+
+        val sb = StringBuilder()
+
+        sb.appendLine("=== EXPORT VEZZO — DISPONIBILITÉS ===")
+        sb.appendLine("Mois à planifier : $month ($days jours)")
+        sb.appendLine("Date de l'export : " + stamp.format(Instant.now().atZone(zone)))
+        sb.appendLine("Personnes contactées : ${contacts.size}")
+        sb.appendLine("Réponses reçues à ce jour : $answered")
+        if (since <= 0L) {
+            sb.appendLine()
+            sb.appendLine("ATTENTION : aucun envoi groupé n'a encore été effectué.")
+            sb.appendLine("Cet export ne contient donc aucune réponse.")
+        }
+        sb.appendLine()
+
+        sb.appendLine("--- CE QUE JE TE DEMANDE ---")
+        sb.appendLine()
+        sb.appendLine("1) LE PLANNING DU MOIS")
+        sb.appendLine("Construis un tableau avec une ligne par jour du mois, du 1 au $days,")
+        sb.appendLine("et trois colonnes : MATIN | APRÈS-MIDI | JOUR COMPLET.")
+        sb.appendLine("Dans chaque case, écris le nom des personnes disponibles sur ce créneau.")
+        sb.appendLine("Une personne qui annonce une journée complète doit apparaître UNIQUEMENT")
+        sb.appendLine("dans la colonne JOUR COMPLET, et pas dans MATIN ni APRÈS-MIDI.")
+        sb.appendLine("Laisse la case vide si personne n'est disponible.")
+        sb.appendLine()
+        sb.appendLine("2) UNE SYNTHÈSE EN UNE PHRASE")
+        sb.appendLine("Dis-moi en une seule phrase si le planning du mois est complet,")
+        sb.appendLine("c'est-à-dire si chaque jour est couvert par au moins une personne.")
+        sb.appendLine("Si ce n'est pas le cas, liste les jours et créneaux sans personne.")
+        sb.appendLine()
+        sb.appendLine("3) LA VERSION HTML")
+        sb.appendLine("Donne-moi ensuite le même tableau sous forme d'un fichier HTML autonome,")
+        sb.appendLine("dans un bloc de code unique, prêt à être enregistré en .html et ouvert")
+        sb.appendLine("dans un navigateur. Il doit contenir le titre du mois, la phrase de synthèse,")
+        sb.appendLine("puis le tableau complet, avec un style CSS intégré et lisible sur téléphone.")
+        sb.appendLine("Les jours sans aucune personne disponible doivent être visuellement signalés.")
+        sb.appendLine()
+
+        sb.appendLine("--- RÈGLES D'INTERPRÉTATION DES RÉPONSES ---")
+        sb.appendLine("Les gens répondent librement, avec leurs propres mots, sans aucun format")
+        sb.appendLine("imposé. Les messages sont souvent approximatifs. Interprète au mieux :")
+        sb.appendLine("- \"dispo le 3 et le 4\" sans précision de créneau = journée complète.")
+        sb.appendLine("- \"le 5 au matin\", \"le 5 dans la matinée\" = matin du 5.")
+        sb.appendLine("- \"l'aprem\", \"l'après-midi\", \"en PM\" = après-midi.")
+        sb.appendLine("- \"toute la journée\", \"en entier\", \"toute la journée du 9\" = journée complète.")
+        sb.appendLine("- Une abréviation isolée (M, A, J après un chiffre) doit être comprise")
+        sb.appendLine("  comme matin, après-midi ou journée, mais ce format n'est pas demandé.")
+        sb.appendLine("- \"du 8 au 12\" = tous les jours de 8 à 12 inclus.")
+        sb.appendLine("- \"tous les lundis\" = tous les lundis du mois concerné.")
+        sb.appendLine("- Les chiffres désignent des jours du mois de $month, jamais un autre mois.")
+        sb.appendLine("- Ignore les messages hors sujet (publicité, opérateur, conversation autre).")
+        sb.appendLine("- Si une réponse est ambiguë ou incompréhensible, ne devine pas :")
+        sb.appendLine("  signale-la dans une courte liste \"À VÉRIFIER\" à la fin, avec le nom.")
+        sb.appendLine("- Si une personne envoie plusieurs SMS, prends en compte l'ensemble,")
+        sb.appendLine("  et en cas de contradiction, retiens le message le plus récent.")
+        sb.appendLine()
+
+        sb.appendLine("--- RÉPONSES REÇUES ---")
+        sb.appendLine()
+
+        if (contacts.isEmpty()) {
+            sb.appendLine("(aucun contact enregistré)")
+        }
+
+        statuses.forEach { cs ->
+            val displayName = if (store.anonymize) cs.contact.firstName else cs.contact.name
+            sb.appendLine("### $displayName")
+            if (cs.replies.isEmpty()) {
+                sb.appendLine("(aucune réponse reçue)")
+            } else {
+                if (cs.status == ReplyStatus.UNCLEAR) {
+                    sb.appendLine("(message reçu, mais qui ne semble pas parler de disponibilités)")
+                }
+                cs.replies.forEach { r ->
+                    val date = stamp.format(Instant.ofEpochMilli(r.dateMillis).atZone(zone))
+                    sb.appendLine("[$date] ${r.body.trim()}")
+                }
+            }
+            sb.appendLine()
+        }
+
+        sb.appendLine("--- FIN DE L'EXPORT ---")
+        return sb.toString()
+    }
+
+    fun fileName(): String =
+        "vezzo_" + fileStamp.format(Instant.now().atZone(ZoneId.systemDefault())) + ".txt"
+
+    /** Écrit l'export dans le cache et renvoie le fichier, partageable via FileProvider. */
+    fun writeToCache(context: Context, content: String): File {
+        val dir = File(context.cacheDir, "exports").apply { mkdirs() }
+        val file = File(dir, fileName())
+        file.writeText(content, Charsets.UTF_8)
+        return file
+    }
+
+    fun copyToClipboard(context: Context, content: String) {
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("Export Vezzo", content))
+    }
+
+    /** Ouvre le sélecteur Android pour envoyer l'export vers l'app de son choix. */
+    fun share(context: Context, content: String) {
+        val file = writeToCache(context, content)
+        val uri = FileProvider.getUriForFile(
+            context, context.packageName + ".fileprovider", file
+        )
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "Disponibilités ${MonthInfo.label()}")
+            putExtra(Intent.EXTRA_TEXT, content)
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(intent, "Envoyer l'export"))
+    }
+
+    /**
+     * Envoie l'export par mail à l'administrateur, destinataire déjà rempli.
+     * Le contenu est mis à la fois dans le corps du mail et en pièce jointe.
+     */
+    fun sendToAdmin(context: Context, store: Store, content: String) {
+        val file = writeToCache(context, content)
+        val uri = FileProvider.getUriForFile(
+            context, context.packageName + ".fileprovider", file
+        )
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "message/rfc822"
+            putExtra(Intent.EXTRA_EMAIL, arrayOf(store.adminEmail))
+            putExtra(Intent.EXTRA_SUBJECT, "Vezzo — disponibilités ${MonthInfo.label()}")
+            putExtra(Intent.EXTRA_TEXT, content)
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(intent, "Envoyer à l'administrateur"))
+    }
+}
+
+/* ===================================================================
+   Section issue de MainActivity.kt
+   =================================================================== */
 
 enum class Screen { HOME, SMS_GROUPE, RELANCE, EXPORT }
 
