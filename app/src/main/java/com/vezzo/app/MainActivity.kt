@@ -370,6 +370,68 @@ object SmsService {
         return byContact
     }
 
+    /** Une ligne brute de la boîte de réception, telle que le système la renvoie. */
+    data class InboxRow(
+        val address: String,
+        val normalized: String,
+        val dateMillis: Long,
+        val preview: String,
+        val matchedContact: String?
+    )
+
+    data class InboxDump(
+        val error: String?,
+        val totalInInbox: Int,
+        val rows: List<InboxRow>
+    )
+
+    /**
+     * Lecture brute utilisée par l'écran de diagnostic. Contrairement à readReplies,
+     * elle ne filtre sur aucune date et remonte explicitement les erreurs.
+     */
+    fun rawInbox(context: Context, contacts: List<Contact>, limit: Int = 25): InboxDump {
+        val rows = mutableListOf<InboxRow>()
+        var total = 0
+        val projection = arrayOf(
+            Telephony.Sms.ADDRESS,
+            Telephony.Sms.BODY,
+            Telephony.Sms.DATE
+        )
+        return try {
+            context.contentResolver.query(
+                Telephony.Sms.Inbox.CONTENT_URI,
+                projection,
+                null,
+                null,
+                "${Telephony.Sms.DATE} DESC"
+            )?.use { cursor ->
+                total = cursor.count
+                val iAddr = cursor.getColumnIndexOrThrow(Telephony.Sms.ADDRESS)
+                val iBody = cursor.getColumnIndexOrThrow(Telephony.Sms.BODY)
+                val iDate = cursor.getColumnIndexOrThrow(Telephony.Sms.DATE)
+                while (cursor.moveToNext() && rows.size < limit) {
+                    val addr = cursor.getString(iAddr).orEmpty()
+                    val norm = PhoneUtils.normalize(addr)
+                    val match = contacts.firstOrNull {
+                        PhoneUtils.normalize(it.phone) == norm
+                    }?.name
+                    rows.add(
+                        InboxRow(
+                            address = addr,
+                            normalized = norm,
+                            dateMillis = cursor.getLong(iDate),
+                            preview = cursor.getString(iBody).orEmpty().take(60),
+                            matchedContact = match
+                        )
+                    )
+                }
+            }
+            InboxDump(null, total, rows)
+        } catch (e: Exception) {
+            InboxDump(e.javaClass.simpleName + " : " + (e.message ?: "sans détail"), total, rows)
+        }
+    }
+
     /**
      * Classe chaque contact selon qu'il a répondu, envoyé un message non reconnu,
      * ou rien envoyé du tout. [manuallyAnswered] contient les numéros normalisés
@@ -583,7 +645,7 @@ object ExportBuilder {
    Section issue de MainActivity.kt
    =================================================================== */
 
-enum class Screen { HOME, SMS_GROUPE, RELANCE, EXPORT }
+enum class Screen { HOME, SMS_GROUPE, RELANCE, EXPORT, DIAGNOSTIC }
 
 class MainActivity : ComponentActivity() {
 
@@ -757,6 +819,7 @@ fun VezzoApp() {
         Screen.SMS_GROUPE -> SmsGroupeScreen(store, refresh, { refresh++ }) { screen = Screen.HOME }
         Screen.RELANCE -> RelanceScreen(store) { screen = Screen.HOME }
         Screen.EXPORT -> ExportScreen(store) { screen = Screen.HOME }
+        Screen.DIAGNOSTIC -> DiagnosticScreen(store) { screen = Screen.HOME }
     }
 }
 
@@ -818,6 +881,10 @@ fun HomeScreen(store: Store, go: (Screen) -> Unit) {
 
             Spacer(Modifier.height(6.dp))
             HorizontalDivider()
+
+            TextButton(onClick = { go(Screen.DIAGNOSTIC) }) {
+                Text("Diagnostic de lecture des SMS")
+            }
 
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -1357,6 +1424,142 @@ fun ExportScreen(store: Store, back: () -> Unit) {
                 ) { Text("Envoyer à l'administrateur") }
             }
         }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun DiagnosticScreen(store: Store, back: () -> Unit) {
+    val context = LocalContext.current
+    var reload by remember { mutableStateOf(0) }
+    val contacts = remember(reload) { store.contacts }
+    val dump = remember(reload) { SmsService.rawInbox(context, contacts) }
+    val hasRead = ContextCompat.checkSelfPermission(
+        context, Manifest.permission.READ_SMS
+    ) == PackageManager.PERMISSION_GRANTED
+
+    val fmt = remember { java.text.SimpleDateFormat("dd/MM HH:mm", Locale.FRENCH) }
+
+    Scaffold(topBar = { SimpleBar("Diagnostic", back) }) { padding ->
+        Column(
+            Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text("État du système", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+
+            DiagLine("Permission READ_SMS", if (hasRead) "accordée" else "REFUSÉE")
+            DiagLine(
+                "Dernier envoi groupé",
+                if (store.lastSendMillis > 0)
+                    fmt.format(java.util.Date(store.lastSendMillis))
+                else "jamais"
+            )
+            DiagLine("Contacts enregistrés", contacts.size.toString())
+            DiagLine("SMS dans la boîte de réception", dump.totalInInbox.toString())
+
+            if (dump.error != null) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer
+                    )
+                ) {
+                    Column(Modifier.padding(14.dp)) {
+                        Text("Erreur de lecture", fontWeight = FontWeight.Bold)
+                        Text(dump.error, fontSize = 12.sp)
+                    }
+                }
+            }
+
+            if (dump.error == null && dump.totalInInbox == 0) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer
+                    )
+                ) {
+                    Column(Modifier.padding(14.dp)) {
+                        Text("Boîte de réception vide", fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "Aucun SMS lisible alors que ton téléphone en contient. " +
+                                "C'est la signature du RCS : les messages « Chat » de Google " +
+                                "Messages ne sont pas stockés dans le fournisseur Telephony " +
+                                "et restent invisibles pour cette application. " +
+                                "Désactive les discussions RCS dans Google Messages, " +
+                                "puis demande un nouveau message.",
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+
+            HorizontalDivider()
+            Text("Numéros enregistrés", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            contacts.forEach { c ->
+                Text(
+                    "${c.name} — ${c.phone}  →  clé ${PhoneUtils.normalize(c.phone)}",
+                    fontSize = 12.sp
+                )
+            }
+            if (contacts.isEmpty()) {
+                Text("Aucun contact.", fontSize = 12.sp)
+            }
+
+            HorizontalDivider()
+            Text(
+                "Derniers SMS lus (${dump.rows.size})",
+                fontWeight = FontWeight.Bold,
+                fontSize = 16.sp
+            )
+            Text(
+                "La clé de l'expéditeur doit correspondre exactement à celle du contact " +
+                    "pour que la réponse soit reconnue.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            dump.rows.forEach { r ->
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (r.matchedContact != null)
+                            MaterialTheme.colorScheme.primaryContainer
+                        else
+                            MaterialTheme.colorScheme.surfaceVariant
+                    )
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(
+                            r.matchedContact ?: "expéditeur inconnu",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
+                        )
+                        Text(
+                            "${r.address}  →  clé ${r.normalized}",
+                            fontSize = 11.sp
+                        )
+                        Text(fmt.format(java.util.Date(r.dateMillis)), fontSize = 11.sp)
+                        Spacer(Modifier.height(4.dp))
+                        Text("« ${r.preview} »", fontSize = 12.sp)
+                    }
+                }
+            }
+
+            Button(
+                onClick = { reload++ },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Relire la boîte de réception") }
+        }
+    }
+}
+
+@Composable
+fun DiagLine(label: String, value: String) {
+    Row(Modifier.fillMaxWidth()) {
+        Text(label, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        Text(value, fontSize = 13.sp, fontWeight = FontWeight.Bold)
     }
 }
 
