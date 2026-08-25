@@ -493,13 +493,27 @@ fun SmsGroupeScreen(store: Store, refreshKey: Int, onRefresh: () -> Unit, back: 
 fun RelanceScreen(store: Store, back: () -> Unit) {
     val context = LocalContext.current
     val contacts = remember { store.contacts }
-    var pending by remember {
-        mutableStateOf(SmsService.nonResponders(context, contacts, store.lastSendMillis))
+    var reloadKey by remember { mutableStateOf(0) }
+
+    val statuses = remember(reloadKey) {
+        SmsService.statuses(context, contacts, store.lastSendMillis, store.manuallyAnswered)
     }
+
+    // Pré-cochés : tous ceux dont on n'a pas identifié de réponse.
+    var selected by remember(reloadKey) {
+        mutableStateOf(
+            statuses.filter { it.status != ReplyStatus.ANSWERED }
+                .map { PhoneUtils.normalize(it.contact.phone) }
+                .toSet()
+        )
+    }
+
     var showSmsDialog by remember { mutableStateOf(false) }
     var showConfirm by remember { mutableStateOf(false) }
 
-    val answered = contacts.size - pending.size
+    val neverSent = store.lastSendMillis == 0L
+    val answeredCount = statuses.count { it.status == ReplyStatus.ANSWERED }
+    val targets = statuses.filter { PhoneUtils.normalize(it.contact.phone) in selected }
 
     Scaffold(topBar = { SimpleBar("Relance", back) }) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
@@ -507,44 +521,111 @@ fun RelanceScreen(store: Store, back: () -> Unit) {
             Card(
                 Modifier.padding(16.dp).fillMaxWidth(),
                 colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.secondaryContainer
+                    containerColor = if (neverSent)
+                        MaterialTheme.colorScheme.errorContainer
+                    else
+                        MaterialTheme.colorScheme.secondaryContainer
                 )
             ) {
                 Column(Modifier.padding(18.dp)) {
-                    Text(
-                        "À ce jour : $answered réponse(s) sur ${contacts.size} contact(s)",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 16.sp
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        if (store.lastSendMillis == 0L)
-                            "Aucun envoi groupé enregistré pour l'instant."
-                        else
-                            "${pending.size} personne(s) n'ont pas encore répondu.",
-                        fontSize = 13.sp
-                    )
+                    if (neverSent) {
+                        Text(
+                            "Aucun envoi groupé effectué",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 16.sp
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Commence par l'écran SMS groupé. Les réponses ne seront " +
+                                "recherchées qu'à partir de la date de cet envoi.",
+                            fontSize = 13.sp
+                        )
+                    } else {
+                        Text(
+                            "À ce jour : $answeredCount réponse(s) sur ${contacts.size} contact(s)",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 16.sp
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Décoche les personnes que tu ne veux pas relancer.",
+                            fontSize = 13.sp
+                        )
+                    }
                 }
             }
 
-            Text(
-                "En attente de réponse",
-                modifier = Modifier.padding(horizontal = 20.dp),
-                fontWeight = FontWeight.Bold
-            )
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "${selected.size} sélectionné(s)",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = {
+                    selected = contacts.map { PhoneUtils.normalize(it.phone) }.toSet()
+                }) { Text("Tout cocher") }
+                TextButton(onClick = { selected = emptySet() }) { Text("Tout décocher") }
+            }
 
             LazyColumn(Modifier.weight(1f).padding(horizontal = 12.dp)) {
-                items(pending) { contact ->
-                    ListItem(
-                        headlineContent = { Text(contact.name) },
-                        supportingContent = { Text(contact.phone) }
-                    )
+                items(statuses) { cs ->
+                    val key = PhoneUtils.normalize(cs.contact.phone)
+                    val isChecked = key in selected
+
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 6.dp, horizontal = 4.dp),
+                        verticalAlignment = Alignment.Top
+                    ) {
+                        Checkbox(
+                            checked = isChecked,
+                            onCheckedChange = {
+                                selected = if (it) selected + key else selected - key
+                            }
+                        )
+                        Column(Modifier.weight(1f).padding(top = 12.dp)) {
+                            Text(cs.contact.name, fontWeight = FontWeight.Medium)
+                            Text(
+                                cs.contact.phone,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            StatusChip(cs.status)
+
+                            if (cs.status == ReplyStatus.UNCLEAR && cs.lastMessage.isNotBlank()) {
+                                Spacer(Modifier.height(4.dp))
+                                Text(
+                                    "« ${cs.lastMessage.take(140)} »",
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            if (cs.status != ReplyStatus.ANSWERED) {
+                                TextButton(
+                                    onClick = {
+                                        store.markAnswered(cs.contact.phone)
+                                        selected = selected - key
+                                        reloadKey++
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 0.dp)
+                                ) { Text("Marquer comme répondu", fontSize = 13.sp) }
+                            }
+                        }
+                    }
                     HorizontalDivider()
                 }
-                if (pending.isEmpty() && contacts.isNotEmpty()) {
+
+                if (contacts.isEmpty()) {
                     item {
                         Text(
-                            "Tout le monde a répondu.",
+                            "Aucun contact enregistré.",
                             modifier = Modifier.padding(20.dp),
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -563,9 +644,9 @@ fun RelanceScreen(store: Store, back: () -> Unit) {
 
                 Button(
                     onClick = { showConfirm = true },
-                    enabled = pending.isNotEmpty(),
+                    enabled = targets.isNotEmpty() && !neverSent,
                     modifier = Modifier.fillMaxWidth().height(52.dp)
-                ) { Text("ENVOYER LA RELANCE (${pending.size})", fontWeight = FontWeight.Bold) }
+                ) { Text("ENVOYER LA RELANCE (${targets.size})", fontWeight = FontWeight.Bold) }
             }
         }
     }
@@ -583,23 +664,55 @@ fun RelanceScreen(store: Store, back: () -> Unit) {
     if (showConfirm) {
         AlertDialog(
             onDismissRequest = { showConfirm = false },
-            title = { Text("Relancer ${pending.size} personnes ?") },
+            title = { Text("Relancer ${targets.size} personne(s) ?") },
             text = {
-                Text(store.smsRelance.fillTemplate(pending.firstOrNull() ?: Contact("Prénom", "")))
+                Column {
+                    Text(
+                        targets.joinToString(", ") { it.contact.name },
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        store.smsRelance.fillTemplate(
+                            targets.firstOrNull()?.contact ?: Contact("Prénom", "")
+                        ),
+                        fontSize = 13.sp
+                    )
+                }
             },
             confirmButton = {
                 TextButton(onClick = {
                     showConfirm = false
-                    val result = SmsService.sendToAll(context, pending, store.smsRelance)
+                    val result = SmsService.sendToAll(
+                        context, targets.map { it.contact }, store.smsRelance
+                    )
                     Toast.makeText(
                         context, "${result.sent} relance(s) envoyée(s).", Toast.LENGTH_LONG
                     ).show()
-                    pending = SmsService.nonResponders(context, contacts, store.lastSendMillis)
+                    reloadKey++
                 }) { Text("Envoyer") }
             },
             dismissButton = {
                 TextButton(onClick = { showConfirm = false }) { Text("Annuler") }
             }
+        )
+    }
+}
+
+@Composable
+fun StatusChip(status: ReplyStatus) {
+    val (label, color) = when (status) {
+        ReplyStatus.ANSWERED -> "A répondu" to MaterialTheme.colorScheme.primaryContainer
+        ReplyStatus.UNCLEAR -> "Message à vérifier" to MaterialTheme.colorScheme.tertiaryContainer
+        ReplyStatus.NONE -> "Sans réponse" to MaterialTheme.colorScheme.surfaceVariant
+    }
+    Surface(color = color, shape = MaterialTheme.shapes.small) {
+        Text(
+            label,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
         )
     }
 }
