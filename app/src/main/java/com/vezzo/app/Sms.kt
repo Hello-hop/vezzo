@@ -190,7 +190,9 @@ object SmsService {
             val key = PhoneUtils.normalize(contact.phone)
             val list = replies[key].orEmpty()
             val status = when {
-                key in manuallyAnswered && list.isNotEmpty() -> ReplyStatus.ANSWERED
+                // Validation manuelle : couvre le cas d'une réponse donnée de vive voix,
+                // sans aucun SMS reçu.
+                key in manuallyAnswered -> ReplyStatus.ANSWERED
                 list.isEmpty() -> ReplyStatus.NONE
                 list.any { ReplyClassifier.looksLikeAvailability(it.body) } -> ReplyStatus.ANSWERED
                 else -> ReplyStatus.UNCLEAR
